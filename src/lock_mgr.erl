@@ -114,7 +114,6 @@ lease_renewed(internal, check_lease_renewal, #{lease := #{stream := RefreshLease
 lease_renewed(EventType, EventContent, Data) ->
     handle_common(EventType, EventContent, Data).
 
-
 terminate(Reason, StateName, Data) ->
     error_logger:info_msg("Terminated Reason ~p StateName ~p Data ~p ~n", [Reason, StateName, Data]),
     ok.
@@ -229,7 +228,7 @@ refresh_lease_helper(RefreshLeaseStream, Data) ->
     NewData = maps:merge(Data, #{lease => #{stream => RefreshLeaseStream, timestamp => Now}}),
     {next_state, lease_renewed, NewData, [{next_event, internal, check_lease_renewal}]}.
 
-waiting(#{watcher:= #{stream := Stream, watch_id := WatchId}} = Data) ->
+waiting(#{watcher:= #{stream := Stream, id := WatchId}} = Data) ->
     Get = grpc_client:get(Stream),
     GrpcSuccessHeaders = grpc_success_headers(),
     case Get of
@@ -243,7 +242,7 @@ waiting(#{watcher:= #{stream := Stream, watch_id := WatchId}} = Data) ->
         GrpcSuccessHeaders ->
             {keep_state_and_data, [{state_timeout, ?WATCH_INTERVAL_MS, check_status}]};
 
-        {data,#{cancel_reason => [],canceled => false, created => false,events => [], watch_id => WatchId}} ->
+        {data,#{cancel_reason := [],canceled := false, created := false,events := [], watch_id := WatchId}} ->
             {keep_state_and_data, [{state_timeout, ?WATCH_INTERVAL_MS, check_status}]};
 
         {data, #{cancel_reason := [], canceled := false, created := false,
@@ -256,7 +255,6 @@ waiting(#{watcher:= #{stream := Stream, watch_id := WatchId}} = Data) ->
                 false -> error_logger:info_msg("DeleteEvent ~p ~n", [DeleteEvent]),
                         {keep_state_and_data, [{state_timeout, ?WATCH_INTERVAL_MS, check_status}]}
             end;
-
         Event ->
             error_logger:error_msg("Unexpected event ~p ~n", [Event]),
             {keep_state_and_data, [{state_timeout, ?WATCH_INTERVAL_MS, check_status}]}
