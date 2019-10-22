@@ -1,8 +1,8 @@
--module(lock_mgr).
+-module(lock_info_db).
 -behaviour(gen_server).
 
 %% API
--export([start_link/0, apply_for_lock/1, is_registered/1, has_lock_async/1, stop/0, cl/1, debug_has_lock/1]).
+-export([start_link/0, cl/1, stop/0, store/1, retrieve/1, delete/1]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -21,25 +21,54 @@
 cl(Request) ->
     gen_server:call(?MODULE, Request).
 
-is_registered({Name, From}) ->
-    gen_server:call(lock_mgr, {is_registered, {Name, From}}).
 
-apply_for_lock(LockRequest)->
-    gen_server:call(lock_mgr, {lock_request, LockRequest}).
+delete(#{host:=Host, port:=Port, key:=Key}=Info) when is_atom(Key) ->
+    KeyBin = erlang:list_to_binary(erlang:atom_to_list(Key)),
+    DeleteRangeReq = #{key => KeyBin},
+    Response = etcdrpc(Host, Port,  fun etcdrpc_client:'DeleteRange'/3, DeleteRangeReq),
 
-debug_has_lock({Name, From}) when is_atom(Name) ->
-    State = gen_server:call(lock_mgr, debug_state),
-    LockRegistry = maps:get(lock_registry, State),
-    case maps:get({Name, From}, LockRegistry, undefined) of
-        {_, LockSrvPid} -> gen_server:call(LockSrvPid, has_lock);
-        undefined -> {error, {lock_not_requested, {Name, From}}}
+    case Response of
+        {ok, #{grpc_status := 0, http_status := 200, result:= #{deleted := 1}}} ->
+            ok;
+
+        {ok, #{grpc_status := 0, http_status := 200, result:= #{deleted := 0}}} ->
+            {error, not_found};
+
+        {error, Error} ->
+            error_logger:error_msg("cannot delete ~p due to ~p ~n", [Info, Error]),
+            {error, Error}
     end.
 
-has_lock_async({LockName, From, Ref} = Sub) when is_atom(LockName)
-                                                andalso is_pid(From)
-                                                andalso is_reference(Ref) ->
-    gen_server:cast(lock_mgr, {has_lock, Sub}).
 
+store(#{host:=Host, port:=Port, key:= Key, value := Value}= Info) when is_map(Info)
+                                                                   and is_atom(Key) ->
+    KeyBin = erlang:list_to_binary(erlang:atom_to_list(Key)),
+    PutReq=#{key => KeyBin, value => erlang:term_to_binary(Value)},
+    Response = etcdrpc(Host, Port, fun etcdrpc_client:'Put'/3, PutReq),
+    case Response of
+        {ok, #{grpc_status := 0, http_status := 200}} -> ok;
+        {error, Error} ->
+            error_logger:error_msg("cannot store ~p due to ~p ~n", [Info, Error]),
+            {error, Error}
+    end.
+
+
+retrieve(#{host:=Host, port:=Port, key:=Key}=Info) when is_atom(Key) ->
+    KeyBin = erlang:list_to_binary(erlang:atom_to_list(Key)),
+    RangeReq = #{key => KeyBin, limit => 1},
+    Response = etcdrpc(Host, Port,  fun etcdrpc_client:'Range'/3, RangeReq),
+
+    case Response of
+        {ok, #{grpc_status := 0, http_status := 200, result:= #{kvs := [#{key :=KeyBin, value := ValueBin}]}}} ->
+            {ok, erlang:binary_to_term(ValueBin)};
+
+        {ok, #{grpc_status := 0, http_status := 200, result:= #{kvs := []}}} ->
+            {error, not_found};
+
+        {error, Error} ->
+            error_logger:error_msg("cannot retrieve ~p due to ~p ~n", [Info, Error]),
+            {error, Error}
+    end.
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -53,13 +82,8 @@ start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 stop() ->
-    State = lock_mgr:cl(debug_state),
-    LockRegistry = maps:get(lock_registry, State),
-
-    RegistryEntries = maps:to_list(LockRegistry),
-    [gen_server:cast(LockSrvPid, stop) || {_N, {_LockRequest ,LockSrvPid}} <- RegistryEntries],
-    utils:server_exit(?MODULE, 5000),
-    ok.
+    ok = gen_server:call(?SERVER, stop_connections),
+    utils:server_exit(?MODULE, 5000).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -84,7 +108,7 @@ init(Args) ->
     process_flag(trap_exit, true),
     {ok,Opts} = opts:make(Args, [], []),
     put(init_opts, Opts), % for observer
-    {ok, #{lock_registry => #{}, debug_pid => undefined}}.
+    {ok, #{connection_registry => #{}, debug_pid => undefined}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -102,28 +126,29 @@ init(Args) ->
     {stop, Reason :: term(), Reply :: term(), NewState :: #{}} |
     {stop, Reason :: term(), NewState :: #{}}).
 
-handle_call(reset_lock_registry,_From, #{lock_registry := _LockRegistry} = State) ->
-    {reply, ok, maps:merge(State, #{lock_registry => #{}})};
 
-handle_call({lock_request, #{name:=Name, from:= From} = LockRequest}, _From, #{lock_registry := LockRegistry} =State) when is_atom(Name) and is_pid(From) ->
-    IsRegistered = maps:is_key({Name, From}, LockRegistry),
-    case IsRegistered of
-        false ->
-            {ok, LockSrvPid}= supervisor:start_child(lock_sup, [LockRequest]),
-            monitor_subscriber_and_its_lock_srv(From, LockSrvPid),
-            %% gen_server:call(LockSrvPid, {set_trace, [lock_status]}),
-            NewSubscriber = #{{Name, From} => {LockRequest, LockSrvPid}},
-            UpdatedLockRegistry = maps:merge(LockRegistry, NewSubscriber),
-            NewState = maps:merge(State, #{lock_registry => UpdatedLockRegistry}),
-            debug_notify(State, {registered_lock, LockRequest}),
-            {reply, ok, NewState};
 
-        true ->
-            {reply, {error, {lock_request_exists, LockRequest}}, State}
+handle_call({get_connection, {Host,Port}}, _From, #{connection_registry:=ConnectionRegistry}=State) ->
+    %%TODO: transform ip-address/dns-name to one of them as part of key for connection registry
+    case maps:get({Host, Port}, ConnectionRegistry, undefined) of
+        undefined ->
+            {ok, Connection} = grpc_client:connect(tcp, Host, Port),
+            Updated = maps:merge(ConnectionRegistry, #{{Host, Port} => Connection}),
+            {reply, Connection, maps:merge(State, #{connection_registry => Updated})};
+
+        ExistingConnection ->
+            {reply,ExistingConnection, State}
     end;
 
-handle_call({is_registered, {Name, From}}, _From, #{lock_registry := LockRegistry} = State) when is_atom(Name) ->
-    {reply, maps:is_key({Name, From}, LockRegistry), State};
+
+handle_call(stop_connections, _From, #{connection_registry:=ConnectionRegistry}=State) ->
+    Results = maps:fold(fun(_K, Connection, Acc) ->
+                            [grpc_client:stop_connection(Connection)] ++ Acc
+                        end,
+                        [],
+                        ConnectionRegistry),
+    {reply, utils:check_all_ok(Results), State};
+
 
 handle_call({set_debug_pid, Pid}, _From, State) ->
     NewState = maps:merge(State, #{debug_pid => Pid}),
@@ -154,12 +179,6 @@ handle_call(Request, _From, State) ->
     {noreply, NewState :: #{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #{}}).
 
-handle_cast({has_lock, {LockName, From, Ref}}, #{lock_registry:=LockRegistry}=State) ->
-    case maps:get({LockName, From}, LockRegistry, undefined) of
-        {_, LockSrvPid} -> gen_server:cast(LockSrvPid, {has_lock, {From, Ref}});
-        undefined -> From ! {has_lock, Ref, {error, {lock_not_requested, LockName, From}}}
-    end,
-    {noreply, State};
 
 handle_cast(_Request, State) ->
     {noreply, State}.
@@ -178,33 +197,6 @@ handle_cast(_Request, State) ->
     {noreply, NewState :: #{}} |
     {noreply, NewState :: #{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #{}}).
-
-handle_info({'DOWN', _Ref, process, Pid, Reason}, State = #{lock_registry:= LockRegistry}) ->
-    error_logger:info_msg("DOWN from ~p , ~p, State ~p ~n", [Pid, Reason, State]),
-    %% When the subscriber process dies we should terminate its lock srv pid as well.
-    LockRegistryEntries = maps:to_list(LockRegistry),
-    SubscriberExists = [{{_N,SubscriberPid}, _E} || {{_N,SubscriberPid}, _E} <- LockRegistryEntries, SubscriberPid =:= Pid],
-    case SubscriberExists of
-        [{{_N,S}, {_LR, LockSrvPid}}] ->
-            %% it is important to terminate a single child with supervisor:terminate_child function
-            error_logger:info_msg("Subscriber process ~p died due to ~p, the lock srv pid ~p will terminate soon, State ~p ~n", [S, Reason, LockSrvPid, State]),
-            supervisor:terminate_child(lock_sup, LockSrvPid),
-            {noreply, State};
-        [] ->
-            %% Let us check if the lock srv process died, then we remove the registration
-            EntryExists = [K || {K, {_LR, LPid}} <- LockRegistryEntries, LPid =:= Pid],
-            case EntryExists of
-                 [] ->
-                        {noreply, State};
-
-                 [{Name, Sub}] ->
-                        UpdatedLockRegistry = maps:remove({Name, Sub}, LockRegistry),
-                        Sub ! {error, {deregistered_lock, {Name, Sub}}},
-                        debug_notify(State, {deregistered_lock, {Name, Sub}}),
-                        {noreply, maps:merge(State, #{lock_registry => UpdatedLockRegistry})}
-
-            end
-    end;
 
 handle_info(_Msg, State) ->
     {noreply,State}.
@@ -242,12 +234,13 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-debug_notify(#{debug_pid:=undefined}, _Msg) ->
-    ok;
-debug_notify(#{debug_pid:=Pid}, Msg) ->
-    Pid ! Msg,
-    ok.
 
-monitor_subscriber_and_its_lock_srv(From, LockSrvPid) ->
-    erlang:monitor(process, LockSrvPid),
-    erlang:monitor(process, From).
+etcdrpc(Host, Port, Fun, Req) when is_list(Host) and is_integer(Port)->
+    try
+        Connection = gen_server:call(?SERVER, {get_connection, {Host, Port}}, 10*1000),
+        erlang:apply(Fun, [Connection, Req,[]])
+    catch C:E ->
+        error_logger:error_msg("~p:~p:~p stacktrace ~p ~n", [?MODULE,C,E,erlang:get_stacktrace()]),
+        %%TODO: if there is connection failure, we can try to restablish the connection and try the operation
+        {error, {C,E}}
+    end.

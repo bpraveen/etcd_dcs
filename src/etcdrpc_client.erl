@@ -1039,4 +1039,3 @@ decoder() -> etcdrpc.
     grpc_client:unary(Connection, Message,
                       'Auth', 'RoleRevokePermission',
                        decoder(), Options).
-

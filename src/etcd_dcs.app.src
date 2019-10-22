@@ -1,16 +1,8 @@
-{application, etcd_dcs,
- [{description, "An OTP application"},
-  {vsn, "0.1.0"},
-  {registered, []},
-  {mod, { etcd_dcs_app, []}},
-  {applications,
-   [kernel,
-    stdlib
-   ]},
-  {env,[]},
-  {modules, []},
-
-  {maintainers, []},
-  {licenses, ["Apache 2.0"]},
-  {links, []}
- ]}.
+{application, etcd_dcs, [
+   {description, "etcd distributed co-ordindation service"},
+   {vsn, hg},
+   {registered, [etcd_dcs_sup, lock_sup, lock_mgr]},
+   {applications, [kernel, stdlib, grpc_client, grpc_lib, cow_lib, http2_client, gpb]},
+   {mod, {etcd_dcs,[]}},
+   {env, []}
+]}.
